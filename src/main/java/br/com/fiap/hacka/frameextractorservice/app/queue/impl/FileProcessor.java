@@ -2,12 +2,9 @@ package br.com.fiap.hacka.frameextractorservice.app.queue.impl;
 
 import br.com.fiap.hacka.core.commons.dto.FilePartDto;
 import java.awt.image.BufferedImage;
-import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PipedInputStream;
@@ -15,8 +12,6 @@ import java.io.PipedOutputStream;
 import java.time.Duration;
 import java.util.Iterator;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -27,12 +22,12 @@ import javax.imageio.ImageWriter;
 import javax.imageio.stream.ImageOutputStream;
 import lombok.extern.slf4j.Slf4j;
 import org.bytedeco.javacv.FFmpegFrameGrabber;
-import org.bytedeco.javacv.FFmpegFrameRecorder;
 import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.Java2DFrameConverter;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
@@ -46,7 +41,6 @@ public class FileProcessor {
     private final PipedInputStream pis;
     private final FilePartConsumer parent;
     private final File zipFile;
-    private volatile boolean finished = false;
     private final int frameInterval;
     private final S3Client s3Client;
     private final S3Presigner s3Presigner;
@@ -80,8 +74,26 @@ public class FileProcessor {
         try {
             String s3Key = "frames/"+ this.userName + "/" + fileName + ".zip";
             String urls3 = getPresignedUrl(s3Key);
+
             while (true) {
                 FilePartDto part = queue.take(); // blocks until chunk arrives
+
+                // remove stored file if an error occured in processamento service.
+                if (part.getBytesRead() == -3) {
+                    try {
+                        String path = part.getFrameFilePath() != null ? part.getFrameFilePath() : s3Key;
+                        s3Client.deleteObject(b -> b.bucket(bucketName).key(path));
+                        log.warn("Upload aborted. File removed from S3 (if existed): {}", path);
+                        parent.ignoreFilePart(part.getFileName(), part.getUserName());
+                    } catch (NoSuchKeyException ex) {
+                        log.info("No S3 object found to delete for key: {}", s3Key);
+                    } catch (Exception ex) {
+                        log.error("Failed to delete object from S3", ex);
+                    }
+                    parent.removeProcessor(fileName);
+                    return null; // exit early
+                }
+
                 if (part.getBytesRead() == -1) {
                     this.userName = part.getUserName();
                     part.setFrameFilePath(urls3);
@@ -175,7 +187,7 @@ public class FileProcessor {
         return s3Presigner.presignGetObject(presignRequest).url().toString();
     }
 
-/*    *//**
+  /**
      * Process the file:
      * - Concatenate chunks in memory using SequenceInputStream
      * - Extract frames via Java2D
@@ -223,56 +235,6 @@ public class FileProcessor {
 
         } catch (Exception e) {
             log.error("Error processing file {}", fileName, e);
-        }
-    }
-
-    public void processNok() {
-        try (FileOutputStream fos = new FileOutputStream(zipFile);
-             ZipOutputStream zipOut = new ZipOutputStream(fos)) {
-
-            // Thread to read frames from FFmpegFrameGrabber
-            Thread grabberThread = new Thread(() -> {
-                try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(pis)) {
-                    grabber.start();
-                    Java2DFrameConverter converter = new Java2DFrameConverter();
-                    int frameIndex = 0;
-                    Frame frame;
-
-                    while ((frame = grabber.grabImage()) != null) {
-                        BufferedImage img = converter.getBufferedImage(frame);
-                        String entryName = fileName + "_frame_" + (frameIndex++) + ".jpg";
-                        zipOut.putNextEntry(new ZipEntry(entryName));
-
-                        try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
-                            ImageIO.write(img, "jpg", baos);
-                            zipOut.write(baos.toByteArray());
-                        }
-
-                        zipOut.closeEntry();
-                    }
-
-                    grabber.stop();
-                } catch (Exception e) {
-                    log.error("Grabber thread error for file {}", fileName, e);
-                }
-            });
-
-            grabberThread.start();
-
-            // Write chunks from queue to PipedOutputStream
-            while (true) {
-                FilePartDto part = queue.take();
-                if (part.getBytesRead() == -1) break; // EOF
-                pos.write(part.getBytes(), 0, part.getBytesRead());
-                pos.flush();
-            }
-
-            pos.close();
-            grabberThread.join();
-            log.info("File {} processed and zipped: {}", fileName, zipFile.getAbsolutePath());
-
-        } catch (Exception e) {
-            log.error("Processing error for file {}", fileName, e);
         }
     }
 
@@ -414,44 +376,5 @@ public class FileProcessor {
         log.info("File [{}] - Frames zipped successfully: {}", fileName, zipFile.getAbsolutePath());
         return zipFile;
     }
-
-    public void process_old() {
-        FilePartDto lastPart = null;
-        Future<?> grabberFuture = Executors.newSingleThreadExecutor().submit(() -> {
-            try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(pis)) {
-                grabber.start();
-                Frame frame;
-                while ((frame = grabber.grabImage()) != null) {
-                    log.info("File [{}] - Got frame {}x{}", fileName, frame.imageWidth, frame.imageHeight);
-                }
-                grabber.stop();
-            } catch (Exception e) {
-                log.error("File [{}] - Grabber error", fileName, e);
-            }
-        });
-
-        try {
-            while (true) {
-                FilePartDto part = queue.take();
-                if (part.getBytesRead() == -1) {
-                    lastPart = part;
-                    break; // EOF
-                }
-                pos.write(part.getBytes(), 0, part.getBytesRead());
-                pos.flush();
-
-                //postar na fila uploadS3 a parte.
-            }
-            pos.close();
-            grabberFuture.get();
-        } catch (Exception e) {
-            log.error("File [{}] - Writer error", fileName, e);
-        } finally {
-            //parent.removeProcessor(fileName); // cleanup in your existing class
-        }
-
-        //armazenar a url do arquivo armazenado.
-        //lastPart.setFrameFilePath();
-        //postar ultima parte na fila.
-    }*/
+    */
 }

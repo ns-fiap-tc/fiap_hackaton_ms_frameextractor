@@ -28,7 +28,6 @@ public class FilePartConsumer {
     private static final Map<String, FileProcessor> fileProcessors = new ConcurrentHashMap<>();
     private static final Set<String> failedFiles = ConcurrentHashMap.newKeySet();
     private final ExecutorService fileProcessingExecutor;
-    //private final Tracer tracer;
     private final MessageProducer messageProducer;
     private final NotificacaoServiceClient notificacaoServiceClient;
     private final S3Client s3Client;
@@ -49,8 +48,8 @@ public class FilePartConsumer {
         String userName = filePartDto.getUserName();
 
         if (filePartDto.isFirstChunk()) {
-            failedFiles.remove(fileName + "|" + userName);
-        } else if (failedFiles.contains(fileName + "|" + userName)) {
+            removeFilePart(fileName, userName);
+        } else if (containsFilePart(fileName, userName)) {
             // skip files that already failed
             log.warn("Skipping chunk for failed file [{}]", fileName);
             return;
@@ -58,72 +57,58 @@ public class FilePartConsumer {
 
         log.info("Received chunk for file [{}], bytesRead={}", fileName, filePartDto.getBytesRead());
 
-        //Span span = tracer.spanBuilder("process-file-chunk").startSpan();
-        try /*(Scope scope = span.makeCurrent())*/ {
-            fileProcessors
-                    .computeIfAbsent(fileName, name -> {
-                        FileProcessor processor = new FileProcessor(name, this, frameInterval, s3Client, s3Presigner, bucketName);
+        fileProcessors
+                .computeIfAbsent(fileName, name -> {
+                    FileProcessor processor = new FileProcessor(name, this, frameInterval, s3Client, s3Presigner, bucketName);
 
-                        fileProcessingExecutor.submit(new Runnable() {
-                            @Override
-                            public void run() {
-                                try {
-                                    String urlDownload = processor.process();
-                                    notificacaoServiceClient.sendWebhook(
-                                            new NotificacaoDto(
-                                                    "Arquivo " + fileName + " processado com sucesso. Link download: "+urlDownload,
-                                                    filePartDto.getWebhookUrl()));
-                                } catch (Exception e) {
-                                    log.error("Error processing file [{}]: {}", fileName, e.getMessage(), e);
+                    fileProcessingExecutor.submit(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                String urlDownload = processor.process();
+                                notificacaoServiceClient.sendWebhook(
+                                        new NotificacaoDto(
+                                                "Arquivo " + fileName + " processado com sucesso. Link download: "+urlDownload,
+                                                filePartDto.getWebhookUrl()));
+                            } catch (Exception e) {
+                                log.error("Error processing file [{}]: {}", fileName, e.getMessage(), e);
 
-                                    // mark the file as failed
-                                    failedFiles.add(fileName + "|" + userName);
+                                // mark the file as failed
+                                ignoreFilePart(fileName, userName);
 
-                                    // stop processing further chunks
-                                    fileProcessors.remove(fileName);
+                                // stop processing further chunks
+                                fileProcessors.remove(fileName);
 
-                                    // mark the DTO with error
-                                    filePartDto.setBytesRead(-2);
+                                // mark the DTO with error
+                                filePartDto.setBytesRead(-2);
 
-                                    // notify user just once
-                                    notificacaoServiceClient.sendWebhook(
-                                            new NotificacaoDto(
-                                                    "Ocorreu um erro durante o processamento do arquivo " + fileName + ".",
-                                                    filePartDto.getWebhookUrl()));
-                                }
+                                // notify user just once
+                                notificacaoServiceClient.sendWebhook(
+                                        new NotificacaoDto(
+                                                "Ocorreu um erro durante o processamento do arquivo " + fileName + ".",
+                                                filePartDto.getWebhookUrl()));
                             }
-                        });
-                        return processor;
-                    })
-                    .submitPart(filePartDto);
+                        }
+                    });
+                    return processor;
+                })
+                .submitPart(filePartDto);
 
-            // send chunk to queue
-            this.messageProducer.send(queueName, filePartDto);
-        } finally {
-            //span.end();
-        }
+        // send chunk to queue
+        this.messageProducer.send(queueName, filePartDto);
     }
 
-    /*public void receiveOld(FilePartDto filePartDto) {
-        String fileName = filePartDto.getFileName();
-        log.info("Received chunk for file [{}], bytesRead={}", fileName, filePartDto.getBytesRead());
+    void ignoreFilePart(String fileName, String userName) {
+        failedFiles.add(fileName + "|" + userName);
+    }
 
-        Span span = tracer.spanBuilder("process-file-chunk").startSpan();
-        try (Scope scope = span.makeCurrent()) {
-            fileProcessors
-                    .computeIfAbsent(fileName, name -> {
-                        FileProcessor processor = new FileProcessor(name, this, frameInterval);
-                        fileProcessingExecutor.submit(processor::process);
-                        return processor;
-                    })
-                    .submitPart(filePartDto);
+    boolean containsFilePart(String fileName, String userName) {
+        return failedFiles.contains(fileName + "|" + userName);
+    }
 
-            //posta os chunks na fila para subir o arquivo completo na S3.
-            this.messageProducer.send(queueName, filePartDto);
-        } finally {
-            span.end();
-        }
-    }*/
+    void removeFilePart(String fileName, String userName) {
+        failedFiles.remove(fileName + "|" + userName);
+    }
 
     void removeProcessor(String fileName) {
         fileProcessors.remove(fileName);
